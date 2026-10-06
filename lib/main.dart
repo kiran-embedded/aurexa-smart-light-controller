@@ -1,0 +1,620 @@
+import 'package:flutter/material.dart';
+import 'dart:ui';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:flutter_displaymode/flutter_displaymode.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter_soloud/flutter_soloud.dart';
+import 'core/theme/app_theme.dart';
+import 'providers/switch_schedule_provider.dart';
+import 'providers/theme_provider.dart';
+import 'screens/login/login_screen.dart';
+import 'screens/intro/aurexa_splash_screen.dart';
+import 'widgets/navigation/custom_transitions.dart';
+import 'screens/setup/firebase_setup_screen.dart';
+
+import 'providers/auth_provider.dart';
+import 'screens/main/main_screen.dart';
+import 'screens/intro/intro_screen.dart';
+
+import 'services/persistence_service.dart';
+import 'services/scheduler_service.dart';
+import 'services/notification_service.dart';
+import 'services/haptic_service.dart';
+import 'services/ble_service.dart';
+import 'providers/switch_provider.dart';
+import 'services/firebase_switch_service.dart';
+import 'providers/immersive_provider.dart';
+import 'providers/animation_provider.dart';
+import 'providers/sound_settings_provider.dart';
+import 'providers/voice_provider.dart';
+import 'providers/display_settings_provider.dart';
+import 'widgets/common/restart_widget.dart';
+import 'services/performance_service.dart';
+import 'core/ui/responsive_layout.dart';
+import 'widgets/debug/global_fps_meter.dart';
+import 'widgets/debug/developer_test_overlay.dart';
+import 'services/performance_monitor_service.dart';
+import 'core/system/display_config.dart';
+
+
+@pragma('vm:entry-point')
+Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  await Firebase.initializeApp();
+  debugPrint("Handling a background message: ${message.messageId}");
+  // The notification is handled by the OS if it contains a 'notification' payload.
+  // For data-only messages, we'd trigger a local notification here.
+}
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  ErrorWidget.builder = (FlutterErrorDetails details) {
+    debugPrint("FATAL_RENDER_ERROR: ${details.exceptionAsString()}");
+    return Material(
+      child: Center(
+        child: Text(
+          details.exceptionAsString(),
+          style: const TextStyle(color: Colors.red),
+        ),
+      ),
+    );
+  };
+  // Preload ONLY what is absolutely critical for the UI tree to exist
+  final prefs = await SharedPreferences.getInstance();
+
+  // Extract initial values for Provider overrides to prevent flash of default state
+  final voiceEnabled = prefs.getBool('voice_enabled') ?? true;
+  final masterSound = prefs.getBool('master_sound') ?? true;
+  final appOpeningSound = prefs.getBool('app_opening_sound') ?? false;
+  final switchSound = prefs.getBool('switch_sound') ?? true;
+
+  // Load Animation Settings
+  final animLaunchIdx = prefs.getInt('anim_launch_type') ?? 0;
+  final animUiIdx = prefs.getInt('anim_ui_type') ?? 0;
+  final animEnabled = prefs.getBool('animations_enabled') ?? true;
+
+  // Preload Theme
+  AppThemeMode initialTheme = AppThemeMode.light;
+  final themeName = prefs.getString('theme_mode_str');
+  if (themeName != null) {
+    try {
+      initialTheme = AppThemeMode.values.firstWhere(
+        (e) => e.toString().split('.').last == themeName,
+        orElse: () => AppThemeMode.light,
+      );
+    } catch (_) {}
+  } else {
+    final themeIndex = prefs.getInt('theme_mode');
+    if (themeIndex != null && themeIndex < AppThemeMode.values.length) {
+      initialTheme = AppThemeMode.values[themeIndex];
+    }
+  }
+
+  final soundSettings = SoundSettings(
+    masterSound: masterSound,
+    appOpeningSound: appOpeningSound,
+    switchSound: switchSound,
+  );
+
+  // Consolidate Firebase & Critical Services (Optimize for Startup Speed)
+  await _initCriticalSystems(prefs);
+
+  runApp(
+    RestartWidget(
+      child: ProviderScope(
+        overrides: [
+          // Pre-inject essential settings to ensure zero-jank first frame
+          themeProvider.overrideWith((ref) => ThemeNotifier(initialTheme)),
+          voiceEnabledProvider.overrideWith(
+            (ref) => VoiceNotifier(voiceEnabled),
+          ),
+          soundSettingsProvider.overrideWith((ref) {
+            final notifier = SoundSettingsNotifier();
+            notifier.seed(soundSettings);
+            return notifier;
+          }),
+          animationSettingsProvider.overrideWith((ref) {
+            return AnimationSettingsNotifier(
+              initialLaunch: AppLaunchAnimation.values[animLaunchIdx],
+              initialUi: UiTransitionAnimation.values[animUiIdx],
+              initialEnabled: animEnabled,
+            );
+          }),
+        ],
+        child: const AurexaCoreApp(),
+      ),
+    ),
+  );
+}
+
+Future<void> _initCriticalSystems(SharedPreferences prefs) async {
+  // 1. Firebase (Parallel)
+  final firebaseFuture = PersistenceService.getFirebaseConfig()
+      .then((config) {
+        if (config != null) {
+          return Firebase.initializeApp(
+            options: FirebaseOptions(
+              apiKey: config['apiKey']!,
+              appId: config['appId']!,
+              messagingSenderId: config['messagingSenderId']!,
+              projectId: config['projectId']!,
+              databaseURL: config['databaseURL'],
+            ),
+          );
+        } else {
+          return Firebase.initializeApp();
+        }
+      })
+      .catchError((e) {
+        debugPrint("Firebase Init Error: $e");
+        return Firebase.app(); // Return default app instance on error to satisfy FutureOr<FirebaseApp>
+      });
+
+  // Only wait for Firebase before proceeding to ensure data flows
+  await firebaseFuture;
+
+  // 2. Critical Services (Now dependent on Firebase being initialized)
+  final servicesFuture = Future.wait([
+    SchedulerService.init(),
+    NotificationService.init(),
+  ]);
+
+  // 3. System UI & Background
+  SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+  SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+
+  _initBackgroundSystems(prefs);
+
+  await servicesFuture;
+}
+
+/// Handle secondary initializations in background to ensure instant Splash visibility
+Future<void> _initBackgroundSystems(SharedPreferences prefs) async {
+  // 1. High Refresh Rate (Non-blocking high-frequency unlock for 90/120fps)
+  try {
+    await FlutterDisplayMode.setHighRefreshRate();
+    final current = await FlutterDisplayMode.active;
+    debugPrint(
+      "🚀 SCHEDULER ENGINE: High Refresh Rate Active: ${current.refreshRate}Hz",
+    );
+  } catch (e) {
+    debugPrint("HighFPS Error: $e");
+  }
+
+  // 2. Audio Engine (Initializes in background)
+  SoLoud.instance.init().catchError((e) => debugPrint("Audio Init Error: $e"));
+
+  // 3. Firebase & Connection Tuning
+  try {
+    // Try custom config first, then default
+    final config = await PersistenceService.getFirebaseConfig();
+    if (config != null) {
+      await Firebase.initializeApp(
+        options: FirebaseOptions(
+          apiKey: config['apiKey']!,
+          appId: config['appId']!,
+          messagingSenderId: config['messagingSenderId']!,
+          projectId: config['projectId']!,
+          databaseURL: config['databaseURL'],
+        ),
+      );
+    } else {
+      await Firebase.initializeApp();
+    }
+    FirebaseSwitchService().optimizeConnection(true);
+  } catch (e) {
+    debugPrint("Firebase Background Init Error: $e");
+  }
+
+  // 4. Haptics, Performance & Pre-caching
+  HapticService.init();
+  PerformanceService.optimizeSettings();
+  PersistenceService.getNicknames();
+}
+
+class AurexaCoreApp extends ConsumerStatefulWidget {
+  const AurexaCoreApp({super.key});
+
+  @override
+  ConsumerState<AurexaCoreApp> createState() => _AurexaCoreAppState();
+}
+
+class _AurexaCoreAppState extends ConsumerState<AurexaCoreApp>
+    with WidgetsBindingObserver {
+  bool _showSplash = true; // Splash screen re-enabled to fix fast-flashing issue
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+
+    // Initialize Alarm Channel
+    const alarmChannel = MethodChannel('com.iot.aurexacontroller/alarm');
+    alarmChannel.setMethodCallHandler((call) async {
+      if (call.method == "getZone") {
+        // This is called when AlarmActivity starts
+        // We can either return the zone or let the call handle navigation
+      }
+    });
+
+    // Global Alarm Listener removed
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      ref
+          .read(bleServiceProvider)
+          .initBLE()
+          .catchError((e) => debugPrint("BLE Init Error: $e"));
+    });
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      if (Firebase.apps.isNotEmpty) {
+        ref.read(firebaseSwitchServiceProvider).preWarmConnection();
+        ref.read(switchDevicesProvider.notifier).resume();
+        ref.read(switchScheduleProvider.notifier).resume();
+      }
+    } else if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive) {
+      if (Firebase.apps.isNotEmpty) {
+        ref.read(switchDevicesProvider.notifier).suspend();
+        ref.read(switchScheduleProvider.notifier).suspend();
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final themeMode = ref.watch(themeProvider);
+    final authState = ref.watch(authProvider);
+    ref.watch(immersiveModeProvider);
+
+    Widget destination;
+    switch (authState) {
+      case AuthState.initial:
+        destination = const IntroScreen();
+        break;
+      case AuthState.authenticated:
+        destination = const MainScreen();
+        break;
+      case AuthState.unconfigured:
+      default:
+        destination = const LoginScreen();
+    }
+
+    final animSettings = ref.watch(animationSettingsProvider);
+
+    final displaySettings = ref.watch(displaySettingsProvider);
+
+    return MaterialApp(
+      title: 'AUREXA',
+      debugShowCheckedModeBanner: false,
+      themeAnimationDuration: Duration.zero,
+      theme: AppTheme.getTheme(themeMode).copyWith(
+        pageTransitionsTheme: _buildPageTransitions(animSettings.uiType),
+      ),
+      builder: (context, child) {
+        Responsive.init(
+          context,
+          scaleMultiplier: displaySettings.displayScale,
+          fontMultiplier: displaySettings.fontSizeMultiplier,
+        );
+        DisplayConfig.init(context);
+        return Consumer(
+          builder: (context, ref, _) {
+            final stats = ref.watch(performanceStatsProvider);
+            debugPrint('ROOT_LOG: Console Visible: ${stats.consoleVisible}');
+            return MediaQuery(
+              data: MediaQuery.of(
+                context,
+              ).copyWith(textScaler: TextScaler.linear(displaySettings.fontSizeMultiplier)),
+              child: Stack(
+                children: [
+                  if (child != null) child,
+                  const GlobalFpsMeter(),
+                  if (stats.consoleVisible) const DeveloperTestOverlay(),
+                ],
+              ),
+            );
+          },
+        );
+      },
+      home: Listener(
+        onPointerDown: (_) =>
+            ref.read(firebaseSwitchServiceProvider).preWarmConnection(),
+        child: _buildOpeningAnimation(
+          animSettings.launchType,
+          _showSplash,
+          child: _showSplash
+              ? RepaintBoundary(
+                  child: AurexaSplashScreen(
+                    key: const ValueKey('splash'),
+                    onFinished: () {
+                      if (mounted) {
+                        setState(() {
+                          _showSplash = false;
+                        });
+                      }
+                    },
+                  ),
+                )
+              : KeyedSubtree(key: ValueKey(authState), child: destination),
+        ),
+      ),
+      scrollBehavior: const MaterialScrollBehavior().copyWith(
+        physics: const BouncingScrollPhysics(),
+        dragDevices: {PointerDeviceKind.touch, PointerDeviceKind.mouse},
+      ),
+    );
+  }
+
+  PageTransitionsTheme _buildPageTransitions(UiTransitionAnimation type) {
+    switch (type) {
+      case UiTransitionAnimation.iOSSlide:
+      case UiTransitionAnimation.iosExactSlide:
+        return const PageTransitionsTheme(
+          builders: {
+            TargetPlatform.android: IOSTransitionBuilder(),
+            TargetPlatform.iOS: CupertinoPageTransitionsBuilder(),
+          },
+        );
+      case UiTransitionAnimation.magneticPull:
+        return const PageTransitionsTheme(
+          builders: {
+            TargetPlatform.android: MagneticPullTransitionBuilder(),
+            TargetPlatform.iOS: MagneticPullTransitionBuilder(),
+          },
+        );
+      case UiTransitionAnimation.gravityDrop:
+        return const PageTransitionsTheme(
+          builders: {
+            TargetPlatform.android: GravityDropTransitionBuilder(),
+            TargetPlatform.iOS: GravityDropTransitionBuilder(),
+          },
+        );
+      case UiTransitionAnimation.butterZoom:
+        return PageTransitionsTheme(
+          builders: {
+            TargetPlatform.android: const AurexaZoomTransitionBuilder(),
+            TargetPlatform.iOS: const AurexaZoomTransitionBuilder(),
+          },
+        );
+      case UiTransitionAnimation.fluidFade:
+        return PageTransitionsTheme(
+          builders: {
+            TargetPlatform.android: const AurexaFadeUpwardsTransitionBuilder(),
+            TargetPlatform.iOS: const AurexaFadeUpwardsTransitionBuilder(),
+          },
+        );
+      case UiTransitionAnimation.zeroLatency:
+        return const PageTransitionsTheme(
+          builders: {
+            TargetPlatform.android: _NoTransitionBuilder(),
+            TargetPlatform.iOS: _NoTransitionBuilder(),
+          },
+        );
+      default:
+        return const PageTransitionsTheme(
+          builders: {
+            TargetPlatform.android: IOSTransitionBuilder(),
+            TargetPlatform.iOS: CupertinoPageTransitionsBuilder(),
+          },
+        );
+    }
+  }
+
+  Widget _buildOpeningAnimation(
+    AppLaunchAnimation type,
+    bool showSplash, {
+    required Widget child,
+  }) {
+    // Ensuring haptics and sound only trigger once per state change limits handled by logic outside this build
+    // But we trigger feedback on complete entry
+
+    // Unified Transition Engine
+    // We strictly differentiate between the Splash and the App using Keys.
+    return AnimatedSwitcher(
+      duration: _getTransitionDuration(type),
+      switchInCurve: _getInCurve(type),
+      switchOutCurve: _getOutCurve(type),
+      layoutBuilder: (currentChild, previousChildren) {
+        return Stack(
+          alignment: Alignment.center,
+          children: <Widget>[
+            ...previousChildren,
+            if (currentChild != null) currentChild,
+          ],
+        );
+      },
+      transitionBuilder: (Widget child, Animation<double> animation) {
+        final isSplash = child.key == const ValueKey('splash');
+
+        // ALWAYS Fade the Splash out gracefully. Never jank it.
+        if (isSplash) {
+          return FadeTransition(
+            opacity: animation,
+            child: child,
+          );
+        }
+
+        // Apply distinct physics for the Incoming App
+        return _buildAppTransition(type, child, animation);
+      },
+      child: child,
+    );
+  }
+
+  Duration _getTransitionDuration(AppLaunchAnimation type) {
+    switch (type) {
+      case AppLaunchAnimation.galaxySpiral:
+      case AppLaunchAnimation.cinematicFade:
+        return const Duration(milliseconds: 1200);
+      case AppLaunchAnimation.cyberGlitch:
+        return const Duration(milliseconds: 600);
+      case AppLaunchAnimation.bladeRunner:
+      case AppLaunchAnimation.pixelReveal:
+        return const Duration(milliseconds: 400); // Fast
+      default:
+        return const Duration(milliseconds: 800);
+    }
+  }
+
+  Curve _getInCurve(AppLaunchAnimation type) {
+    switch (type) {
+      case AppLaunchAnimation.galaxySpiral:
+        return Curves.easeOutExpo;
+      case AppLaunchAnimation.bottomSpring:
+        return Curves.elasticOut;
+      case AppLaunchAnimation.fluidWave:
+        return Curves.easeInOutCubic;
+      default:
+        return Curves.easeOutQuart;
+    }
+  }
+
+  Curve _getOutCurve(AppLaunchAnimation type) =>
+      Curves.linear; // Splash always linear out for consistency
+
+  Widget _buildAppTransition(
+    AppLaunchAnimation type,
+    Widget child,
+    Animation<double> animation,
+  ) {
+    switch (type) {
+      // 1. LIQUID / FLUID (Smooth scaling from center)
+      case AppLaunchAnimation.fluidWave:
+      case AppLaunchAnimation.liquidReveal:
+        return FadeTransition(
+          opacity: animation,
+          child: ScaleTransition(
+            scale: Tween<double>(begin: 0.92, end: 1.0).animate(
+              CurvedAnimation(
+                parent: animation,
+                curve: Curves.fastLinearToSlowEaseIn,
+              ),
+            ),
+            child: child,
+          ),
+        );
+
+      // 2. CINEMATIC / ENERGY (Complex Physics)
+      case AppLaunchAnimation.galaxySpiral:
+        return RotationTransition(
+          turns: Tween<double>(begin: 0.8, end: 1.0).animate(
+            // Subtle twist entry
+            CurvedAnimation(parent: animation, curve: Curves.easeOutExpo),
+          ),
+          child: ScaleTransition(
+            scale: Tween<double>(begin: 0.5, end: 1.0).animate(
+              CurvedAnimation(parent: animation, curve: Curves.easeOutExpo),
+            ),
+            child: FadeTransition(opacity: animation, child: child),
+          ),
+        );
+
+      case AppLaunchAnimation.quantumTunnel:
+        return ScaleTransition(
+          scale: Tween<double>(begin: 2.0, end: 1.0).animate(
+            // Zoom IN from void
+            CurvedAnimation(parent: animation, curve: Curves.easeOutQuart),
+          ),
+          child: FadeTransition(opacity: animation, child: child),
+        );
+
+      case AppLaunchAnimation.hologramRise:
+      case AppLaunchAnimation.neonPulse:
+        return SlideTransition(
+          position: Tween<Offset>(begin: const Offset(0, 0.2), end: Offset.zero)
+              .animate(
+                CurvedAnimation(parent: animation, curve: Curves.easeOutBack),
+              ),
+          child: FadeTransition(
+            opacity: animation,
+            child: ScaleTransition(
+              scale: Tween<double>(begin: 0.85, end: 1.0).animate(
+                CurvedAnimation(
+                  parent: animation,
+                  curve: Curves.easeOutBack,
+                ), // Pulse/Pop
+              ),
+              child: child,
+            ),
+          ),
+        );
+
+      case AppLaunchAnimation.cinematicFade:
+        return FadeTransition(
+          opacity: animation,
+          child: ScaleTransition(
+            scale: Tween<double>(begin: 1.1, end: 1.0).animate(
+              // Gentle push back
+              CurvedAnimation(parent: animation, curve: Curves.easeOutCubic),
+            ),
+            child: child,
+          ),
+        );
+
+      // 3. FAST / BLADE RUNNER (Sharp slide up)
+      case AppLaunchAnimation.bladeRunner:
+      case AppLaunchAnimation.bottomSpring:
+        return SlideTransition(
+          position: Tween<Offset>(begin: const Offset(0, 0.1), end: Offset.zero)
+              .animate(
+                CurvedAnimation(parent: animation, curve: Curves.easeOutBack),
+              ),
+          child: FadeTransition(opacity: animation, child: child),
+        );
+
+      // 4. GLITCH / CYBER (Holographic flicker entry)
+      case AppLaunchAnimation.cyberGlitch:
+      case AppLaunchAnimation.pixelReveal:
+        return AnimatedBuilder(
+          animation: animation,
+          builder: (context, c) {
+            // Simulated interference
+            final val = animation.value;
+            final offset = (val < 0.8) ? (0.02 * (1 - val)) : 0.0;
+            return Transform.translate(
+              offset: Offset(offset * 100, 0),
+              child: Opacity(opacity: val.clamp(0.0, 1.0), child: c),
+            );
+          },
+          child: child,
+        );
+
+      // 5. IPHONE / DEFAULT (Standard smooth fade-scale)
+      default:
+        return FadeTransition(
+          opacity: animation,
+          child: ScaleTransition(
+            scale: Tween<double>(begin: 0.95, end: 1.0).animate(
+              CurvedAnimation(parent: animation, curve: Curves.easeOutCubic),
+            ),
+            child: child,
+          ),
+        );
+    }
+  }
+}
+
+class _NoTransitionBuilder extends PageTransitionsBuilder {
+  const _NoTransitionBuilder();
+  @override
+  Widget buildTransitions<T>(
+    PageRoute<T> route,
+    BuildContext context,
+    Animation<double> animation,
+    Animation<double> secondaryAnimation,
+    Widget child,
+  ) => child;
+}
